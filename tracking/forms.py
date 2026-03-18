@@ -1,17 +1,22 @@
+import json
 import re
-from routes.models import timetableEntry, route
-from fleet.models import fleet
-from .models import Tracking
-from django import forms
 from datetime import datetime, timedelta
-from django.utils import timezone
+
+from django import forms
 from django.db.models import Case, When
+from django.utils import timezone
+
+from fleet.models import fleet
+from routes.models import route, timetableEntry
+
+from .models import Tracking
 
 
 def alphanum_key(fleet_number):
+    """Sort key that correctly interleaves letters and numbers (e.g. V1 < V2 < V10)."""
     return [
-        int(text) if text.isdigit() else text.lower()
-        for text in re.split(r"([0-9]+)", fleet_number or "")
+        int(part) if part.isdigit() else part.lower()
+        for part in re.split(r"([0-9]+)", fleet_number or "")
     ]
 
 
@@ -26,21 +31,47 @@ def make_aware_dst(dt):
         return timezone.make_aware(dt + timedelta(hours=1), tz)
 
 
-def _get_stop_times(timetable):
+def _parse_stop_times(timetable):
     """
-    Safely retrieve stop_times as a dict regardless of whether the field
-    is stored as a JSONField (already a dict) or a TextField (JSON string).
+    Return stop_times as a dict regardless of whether it is stored as a
+    JSONField (already a dict) or a TextField (JSON string).
     """
     stop_times = timetable.stop_times
     if isinstance(stop_times, str):
-        import json
         return json.loads(stop_times)
     return stop_times
 
 
+def _build_start_end(timetable, start_time):
+    """
+    Given a timetable entry and a chosen start time string, return
+    (start_stop, end_stop, dt_start, dt_end) or raise ValidationError.
+    """
+    stop_times = _parse_stop_times(timetable)
+    stop_order = list(stop_times)
+    start_stop, end_stop = stop_order[0], stop_order[-1]
+
+    try:
+        idx = stop_times[start_stop]["times"].index(start_time)
+        end_time = stop_times[end_stop]["times"][idx]
+    except (KeyError, ValueError, IndexError):
+        raise forms.ValidationError("Invalid time selected.")
+
+    today = timezone.localdate()
+    fmt = "%Y-%m-%d %H:%M"
+    dt_start = make_aware_dst(datetime.strptime(f"{today} {start_time}", fmt))
+    dt_end = make_aware_dst(datetime.strptime(f"{today} {end_time}", fmt))
+
+    # Handle services that run past midnight
+    if dt_end <= dt_start:
+        dt_end += timedelta(days=1)
+
+    return start_stop, end_stop, dt_start, dt_end
+
+
 class TrackingForm(forms.ModelForm):
     tracking_route = forms.ModelChoiceField(
-        queryset=route.objects.none(),  # populated in __init__
+        queryset=route.objects.none(),
         required=False,
         label="Route",
     )
@@ -54,9 +85,15 @@ class TrackingForm(forms.ModelForm):
     class Meta:
         model = Tracking
         fields = [
-            "tracking_vehicle", "tracking_route", "timetable", "start_time_choice",
-            "tracking_start_location", "tracking_end_location",
-            "tracking_start_at", "tracking_end_at", "tracking_data",
+            "tracking_vehicle",
+            "tracking_route",
+            "timetable",
+            "start_time_choice",
+            "tracking_start_location",
+            "tracking_end_location",
+            "tracking_start_at",
+            "tracking_end_at",
+            "tracking_data",
         ]
         widgets = {
             "tracking_start_at": forms.DateTimeInput(attrs={"type": "datetime-local"}),
@@ -76,17 +113,15 @@ class TrackingForm(forms.ModelForm):
 
     def _configure_vehicle_queryset(self, operator):
         """
-        Sort fleet alphanumerically in Python (avoids a heavy Case/When expression),
-        then reassign the queryset using the pre-sorted ID list.
+        Sort fleet alphanumerically in Python (avoids a fragile Case/When
+        on large querysets), then preserve that order in one DB query.
         """
         fleet_qs = fleet.objects.filter(operator=operator).only("id", "fleet_number")
-        sorted_fleet = sorted(fleet_qs, key=lambda f: alphanum_key(f.fleet_number))
-        ordered_ids = [f.id for f in sorted_fleet]
+        sorted_ids = [f.id for f in sorted(fleet_qs, key=lambda f: alphanum_key(f.fleet_number))]
 
-        # One clean DB hit with preserved Python sort order
-        preserved = Case(*[When(pk=pk, then=pos) for pos, pk in enumerate(ordered_ids)])
+        preserved = Case(*[When(pk=pk, then=pos) for pos, pk in enumerate(sorted_ids)])
         self.fields["tracking_vehicle"].queryset = (
-            fleet.objects.filter(pk__in=ordered_ids).order_by(preserved)
+            fleet.objects.filter(pk__in=sorted_ids).order_by(preserved)
         )
 
     def clean(self):
@@ -97,30 +132,16 @@ class TrackingForm(forms.ModelForm):
         if not (timetable and start_time):
             return cleaned_data
 
-        stop_times = _get_stop_times(timetable)
-        stop_order = list(stop_times)
-        start_stop, end_stop = stop_order[0], stop_order[-1]
+        start_stop, end_stop, dt_start, dt_end = _build_start_end(timetable, start_time)
 
-        try:
-            idx = stop_times[start_stop]["times"].index(start_time)
-            end_time = stop_times[end_stop]["times"][idx]
-        except (KeyError, ValueError, IndexError):
-            raise forms.ValidationError("Invalid time selected.")
-
-        today = timezone.localdate()
-        dt_start = make_aware_dst(datetime.strptime(f"{today} {start_time}", "%Y-%m-%d %H:%M"))
-        dt_end = make_aware_dst(datetime.strptime(f"{today} {end_time}", "%Y-%m-%d %H:%M"))
-
-        if dt_end <= dt_start:
-            dt_end += timedelta(days=1)
-
-        cleaned_data.update({
-            "tracking_start_location": start_stop,
-            "tracking_end_location": end_stop,
-            "tracking_start_at": dt_start,
-            "tracking_end_at": dt_end,
-        })
-
+        cleaned_data.update(
+            {
+                "tracking_start_location": start_stop,
+                "tracking_end_location": end_stop,
+                "tracking_start_at": dt_start,
+                "tracking_end_at": dt_end,
+            }
+        )
         return cleaned_data
 
 
